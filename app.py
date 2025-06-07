@@ -1,50 +1,81 @@
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from enum import Enum
+from pydantic import BaseModel, validator
+import shutil
+import uuid
+import os
+from PIL import Image
+import numpy as np
+import torch
+import faiss
+from transformers import CLIPProcessor, CLIPModel
 from sentence_transformers import SentenceTransformer, util
 from deep_translator import GoogleTranslator
 from langdetect import detect, LangDetectException
-from ultralytics import YOLO
-from huggingface_hub import hf_hub_download
-from deepface import DeepFace
-from PIL import Image
-from enum import Enum
-import shutil
-import os
-import json
 
 app = FastAPI()
+
+IMAGE_FOLDER = "static/images_db"
+UPLOAD_FOLDER = "uploads"
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-text_model = SentenceTransformer('paraphrase-MiniLM-L12-v2')
-yolo_model_path = hf_hub_download(repo_id="arnabdhar/YOLOv8-Face-Detection", filename="model.pt")
-face_model = YOLO(yolo_model_path)
+clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+text_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
-attribute_weights = {
-    "name": 0.5,
-    "national_id": 0.3,
-    "governorate": 0.1,
-    "city": 0.05,
-    "street": 0.05
-}
-
-THRESHOLD = 0.75
 
 class MatchType(str, Enum):
     text = "text"
-    Image = "image"
+    image = "image"
     both = "both"
 
+
+class MatchTextData(BaseModel):
+    match_type: MatchType
+    lost_brand: str = ""
+    lost_color: str = ""
+    lost_government: str = ""
+    lost_center: str = ""
+    lost_street: str = ""
+    lost_contact: str = ""
+    found_brand: str = ""
+    found_color: str = ""
+    found_government: str = ""
+    found_center: str = ""
+    found_street: str = ""
+    found_contact: str = ""
+
+    @validator("*", pre=True)
+    def allow_numbers_in_fields(cls, v):
+        if isinstance(v, str) and len(v.strip()) == 0:
+            return ""
+        return v
+
+    @validator("lost_street", "found_street")
+    def validate_street(cls, v):
+        if not isinstance(v, str):
+            raise ValueError("Street must be a string.")
+        return v.strip()
+
+
+attributes = {
+    "brand": 0.3,
+    "color": 0.2,
+    "government": 0.2,
+    "center": 0.15,
+    "street": 0.15,
+}
+
+
 def translate_text(text, target_lang="en"):
+    if not text or len(text) < 3:
+        return text
     try:
-        if not text or len(text) < 3:
-            return text
         detected_lang = detect(text)
         if detected_lang != target_lang:
             return GoogleTranslator(source='auto', target=target_lang).translate(text)
@@ -52,149 +83,160 @@ def translate_text(text, target_lang="en"):
         return text
     return text
 
-def calculate_text_similarity(lost: dict, found: dict):
+
+def calculate_similarity(lost, found):
     total_score = 0
-    total_weight = sum(attribute_weights.values())
-    for attr, weight in attribute_weights.items():
+    total_weight = sum(attributes.values())
+    for attr, weight in attributes.items():
         text1 = translate_text(str(lost[attr]))
         text2 = translate_text(str(found[attr]))
-        emb1 = text_model.encode(text1, convert_to_tensor=True)
-        emb2 = text_model.encode(text2, convert_to_tensor=True)
-        sim = util.pytorch_cos_sim(emb1, emb2).item()
-        total_score += sim * weight
+        embedding1 = text_model.encode(text1, convert_to_tensor=True)
+        embedding2 = text_model.encode(text2, convert_to_tensor=True)
+        similarity = util.pytorch_cos_sim(embedding1, embedding2).item()
+        total_score += similarity * weight
     return total_score / total_weight
 
-def detect_and_crop_face(image_path, prefix="face"):
-    img = Image.open(image_path).convert("RGB")
-    result = face_model(img, classes=[0])
-    boxes = result[0].boxes.xyxy.cpu().numpy()
-    scores = result[0].boxes.conf.cpu().numpy()
-    for i, score in enumerate(scores):
-        if score > 0.5:
-            x1, y1, x2, y2 = map(int, boxes[i])
-            face = img.crop((x1, y1, x2, y2))
-            output_path = f"static/faces/{prefix}_face.jpg"
-            os.makedirs("static/faces", exist_ok=True)
-            face.save(output_path)
-            return output_path
-    return None
+
+def get_image_embedding(image_path):
+    image = Image.open(image_path).convert("RGB")
+    inputs = clip_processor(images=image, return_tensors="pt", padding=True)
+    with torch.no_grad():
+        image_features = clip_model.get_image_features(**inputs)
+    return image_features[0].cpu().numpy()
+
+
+def build_faiss_index(image_folder):
+    embeddings = []
+    paths = []
+    for img in os.listdir(image_folder):
+        if img.startswith("."):
+            continue
+        path = os.path.join(image_folder, img)
+        emb = get_image_embedding(path)
+        embeddings.append(emb)
+        paths.append(path)
+    embedding_matrix = np.vstack(embeddings).astype("float32")
+    faiss.normalize_L2(embedding_matrix)
+    index = faiss.IndexFlatIP(embedding_matrix.shape[1])
+    index.add(embedding_matrix)
+    return index, paths
+
+
+def find_most_similar_images_faiss(input_image_path, image_folder, top_k=3):
+    emb = get_image_embedding(input_image_path).reshape(1, -1).astype("float32")
+    faiss.normalize_L2(emb)
+    index, paths = build_faiss_index(image_folder)
+    distances, indices = index.search(emb, top_k)
+    results = []
+    for i in range(top_k):
+        result = {
+            "image_path": paths[indices[0][i]],
+            "similarity": float(distances[0][i])
+        }
+        results.append(result)
+    return results
+
 
 @app.post("/match/")
-async def match(
+async def match_items(
     match_type: MatchType = Form(...),
-
-    lost_name: str = Form(None),
-    lost_national_id: str = Form(None),
-    lost_governorate: str = Form(None),
-    lost_city: str = Form(None),
-    lost_street: str = Form(None),
-
-    found_name: str = Form(None),
-    found_national_id: str = Form(None),
-    found_governorate: str = Form(None),
-    found_city: str = Form(None),
-    found_street: str = Form(None),
-
-    lost_image: UploadFile = File(None),
-    found_image: UploadFile = File(None),
+    lost_brand: str = Form(""),
+    lost_color: str = Form(""),
+    lost_government: str = Form(""),
+    lost_center: str = Form(""),
+    lost_street: str = Form(""),
+    lost_contact: str = Form(""),
+    found_brand: str = Form(""),
+    found_color: str = Form(""),
+    found_government: str = Form(""),
+    found_center: str = Form(""),
+    found_street: str = Form(""),
+    found_contact: str = Form(""),
+    image: UploadFile = File(None),
 ):
-    lost = {}
-    found = {}
-    text_score = None
-    face_verified = None
-    face_distance = None
-    lost_face_url = None
-    found_face_url = None
-
-    # Load metadata/contact info from staticdb/metadata.json
-    metadata_path = "staticdb/metadata.json"
-    if os.path.exists(metadata_path):
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            contact_info_dict = json.load(f)
-    else:
-        contact_info_dict = {}
-
+    # تحقق من الحقول بناءً على نوع المطابقة
     if match_type in ["text", "both"]:
-        required_fields = [lost_name, lost_national_id, lost_governorate, lost_city, lost_street,
-                           found_name, found_national_id, found_governorate, found_city, found_street]
-        if any(field is None for field in required_fields):
-            return {"error": "Missing required text fields"}
+        text_data = MatchTextData(
+            match_type=match_type,
+            lost_brand=lost_brand,
+            lost_color=lost_color,
+            lost_government=lost_government,
+            lost_center=lost_center,
+            lost_street=lost_street,
+            lost_contact=lost_contact,
+            found_brand=found_brand,
+            found_color=found_color,
+            found_government=found_government,
+            found_center=found_center,
+            found_street=found_street,
+            found_contact=found_contact,
+        )
+    if match_type in ["image", "both"] and not image:
+        raise HTTPException(status_code=400, detail="Image is required for image or both match types.")
 
-        lost = {
-            "name": lost_name,
-            "national_id": lost_national_id,
-            "governorate": lost_governorate,
-            "city": lost_city,
-            "street": lost_street,
-        }
-
-        found = {
-            "name": found_name,
-            "national_id": found_national_id,
-            "governorate": found_governorate,
-            "city": found_city,
-            "street": found_street,
-        }
-
-        text_score = calculate_text_similarity(lost, found)
-
-    if match_type in ["image", "both"]:
-        if lost_image is None or found_image is None:
-            return {"error": "Missing image files"}
-
-        lost_img_path = f"static/{lost_image.filename}"
-        found_img_path = f"static/{found_image.filename}"
-        with open(lost_img_path, "wb") as f:
-            shutil.copyfileobj(lost_image.file, f)
-        with open(found_img_path, "wb") as f:
-            shutil.copyfileobj(found_image.file, f)
-
-        try:
-            cropped1 = detect_and_crop_face(lost_img_path, prefix="lost")
-            cropped2 = detect_and_crop_face(found_img_path, prefix="found")
-
-            if cropped1 and cropped2:
-                result = DeepFace.verify(
-                    img1_path=cropped1,
-                    img2_path=cropped2,
-                    model_name="Facenet512", 
-                    distance_metric="euclidean_l2",
-                    threshold=0.7
-                )
-                face_verified = result["verified"]
-                face_distance = result["distance"]
-                lost_face_url = f"/static/faces/lost_face.jpg"
-                found_face_url = f"/static/faces/found_face.jpg"
-        except Exception as e:
-            print(f"Face matching error: {e}")
-        finally:
-            if os.path.exists(lost_img_path): os.remove(lost_img_path)
-            if os.path.exists(found_img_path): os.remove(found_img_path)
-
-    final_result = None
-    if match_type == "text":
-        final_result = text_score > THRESHOLD
-    elif match_type == "image":
-        final_result = face_verified
-    elif match_type == "both":
-        final_result = (text_score and text_score > THRESHOLD) and face_verified
-
-    # Retrieve contact info
-    lost_contact = contact_info_dict.get("lost_face.jpg", None)
-    found_contact = contact_info_dict.get("found_face.jpg", None)
-
-    return {
-        "text_similarity": round(text_score, 4) if text_score is not None else None,
-        "face_verified": face_verified,
-        "face_distance": face_distance,
-        "match_result": final_result,
-        "face_images": {
-            "lost_face": f"http://localhost:2000{lost_face_url}" if lost_face_url else None,
-            "found_face": f"http://localhost:2000{found_face_url}" if found_face_url else None
-        },
-        "contact_info": {
-            
-            "found": found_contact
-        }
+    lost_item = {
+        "brand": lost_brand,
+        "color": lost_color,
+        "government": lost_government,
+        "center": lost_center,
+        "street": lost_street,
+        "contact": lost_contact,
     }
+
+    found_item = {
+        "brand": found_brand,
+        "color": found_color,
+        "government": found_government,
+        "center": found_center,
+        "street": found_street,
+        "contact": found_contact,
+    }
+
+    image_score = 0
+    text_score = 0
+    final_score = 0
+    matched_images = []
+
+    try:
+        if match_type in ["image", "both"] and image:
+            temp_filename = f"{uuid.uuid4().hex}_{image.filename}"
+            temp_path = os.path.join(UPLOAD_FOLDER, temp_filename)
+            with open(temp_path, "wb") as buffer:
+                shutil.copyfileobj(image.file, buffer)
+
+            image_results = find_most_similar_images_faiss(temp_path, IMAGE_FOLDER, top_k=3)
+
+            matched_images = [
+                {
+                    "image_url": f"/static/images_db/{os.path.basename(res['image_path'])}",
+                    "image_similarity": round(res["similarity"], 4)
+                }
+                for res in image_results
+            ]
+            image_score = image_results[0]["similarity"]
+
+        if match_type in ["text", "both"]:
+            text_score = calculate_similarity(lost_item, found_item)
+
+        if match_type == "text":
+            final_score = text_score
+        elif match_type == "image":
+            final_score = image_score
+        elif match_type == "both":
+            final_score = (text_score * 0.5) + (image_score * 0.5)
+
+        matched = 1 if final_score > 0.7 else 0
+
+        return JSONResponse({
+            "match_type": match_type,
+            "matched_images": matched_images,
+            "image_similarity": round(image_score, 4),
+            "text_similarity": round(text_score, 4),
+            "final_score": round(final_score, 4),
+            "matched": matched
+        })
+
+    finally:
+        if match_type in ["image", "both"] and image:
+            os.remove(temp_path)
 
